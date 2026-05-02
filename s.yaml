@@ -1,0 +1,92 @@
+apiVersion: template.openshift.io/v1
+kind: Template
+metadata:
+  name: norvya-stable-host
+  namespace: mylastres0rt05-redha-dev
+objects:
+  - apiVersion: v1
+    kind: PersistentVolumeClaim
+    metadata:
+      name: '${NAME}-pvc'
+    spec:
+      accessModes:
+        - ReadWriteOnce
+      resources:
+        requests:
+          storage: '${DISK_SIZE}'
+      storageClassName: gp3
+
+  - apiVersion: kubevirt.io/v1
+    kind: VirtualMachine
+    metadata:
+      name: '${NAME}'
+    spec:
+      runStrategy: Always
+      template:
+        spec:
+          domain:
+            cpu: { cores: 2 }
+            memory: { guest: 4Gi }
+            devices:
+              disks:
+                - disk: { bus: virtio }
+                  name: rootdisk
+                - disk: { bus: virtio }
+                  name: data-pvc
+                - disk: { bus: virtio }
+                  name: cloudinitdisk
+          volumes:
+            - name: rootdisk
+              containerDisk: { image: 'quay.io/containerdisks/ubuntu:22.04' }
+            - name: data-pvc
+              persistentVolumeClaim: { claimName: '${NAME}-pvc' }
+            - name: cloudinitdisk
+              cloudInitNoCloud:
+                userData: |
+                  #cloud-config
+                  user: ubuntu
+                  password: '${PASSWORD}'
+                  chpasswd: { expire: False }
+                  ssh_pwauth: true
+
+                  # PHASE 1: Initialize the 40Gi PVC
+                  fs_setup:
+                    - label: data_pvc
+                      filesystem: 'ext4'
+                      device: /dev/vdb
+                  mounts:
+                    - [ /dev/vdb, /mnt/pvc, "ext4", "defaults", "0", "2" ]
+
+                  # PHASE 2: Redirect high-traffic folders to the PVC (Disk Space Fix)
+                  runcmd:
+                    - mkdir -p /mnt/pvc/docker /mnt/pvc/apt_cache /mnt/pvc/apt_lib
+                    - mount --bind /mnt/pvc/docker /var/lib/docker
+                    - mount --bind /mnt/pvc/apt_cache /var/cache/apt
+                    - mount --bind /mnt/pvc/apt_lib /var/lib/apt
+                    
+                    # PHASE 3: Network & Software Setup
+                    # Lower MTU slightly for cloud stability
+                    - ip link set dev enp1s0 mtu 1400
+                    - apt-get update
+                    - apt-get install -y docker.io curl
+                    - sh -c "$(curl -sSf https://downloads.nordcdn.com/apps/linux/install.sh)"
+                    
+                    # PHASE 4: NordVPN Host Configuration
+                    - systemctl enable --now nordvpnd
+                    - nordvpn whitelist add port 22
+                    - nordvpn set ipv6 off
+                    - systemctl enable --now docker
+                    - usermod -aG docker ubuntu
+                    - usermod -aG nordvpn ubuntu
+                    
+                    # Final Cleanup
+                    - apt-get clean
+
+parameters:
+  - name: NAME
+    generate: expression
+    from: 'norvya-[a-z0-9]{4}'
+  - name: DISK_SIZE
+    value: 40Gi
+  - name: PASSWORD
+    value: 'ubuntu123'
