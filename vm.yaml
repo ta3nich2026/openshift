@@ -1,0 +1,113 @@
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: norvya-16da
+  namespace: mylastres0rt05-redha-dev
+spec:
+  runStrategy: Always
+  template:
+    spec:
+      domain:
+        cpu:
+          cores: 2
+        devices:
+          disks:
+            - disk:
+                bus: virtio
+              name: rootdisk
+            - disk:
+                bus: virtio
+              name: data-pvc
+            - disk:
+                bus: virtio
+              name: cloudinitdisk
+        memory:
+          guest: 4Gi
+      volumes:
+        - containerDisk:
+            image: 'quay.io/containerdisks/ubuntu:22.04'
+          name: rootdisk
+        - name: data-pvc
+          persistentVolumeClaim:
+            claimName: norvya-16da-pvc
+        - cloudInitNoCloud:
+            name: cloudinitdisk
+            userData: |
+              #cloud-config
+              user: ubuntu
+              password: 'ubuntu123'
+              chpasswd: { expire: False }
+              ssh_pwauth: true
+
+              # 1. DISK INITIALIZATION (39GB PVC)
+              fs_setup:
+                - device: /dev/vdb
+                  filesystem: 'ext4'
+                  label: data_pvc
+              mounts:
+                - [ /dev/vdb, /mnt/pvc, "ext4", "defaults", "0", "2" ]
+
+              # 2. RUN-ONCE & EVERY-BOOT LOGIC
+              runcmd:
+                # Setup absolute paths
+                - export PATH=$PATH:/usr/sbin:/usr/bin:/sbin:/bin
+                
+                # Create TUN device for VPN (Mandatory for Sandboxes)
+                - mkdir -p /dev/net
+                - [ ls, -c, /dev/net/tun ] || mknod /dev/net/tun c 10 200
+                - chmod 666 /dev/net/tun
+
+                # Redirect Storage to PVC (The Space Fix)
+                - mkdir -p /mnt/pvc/docker /mnt/pvc/containerd /mnt/pvc/apt_cache
+                - systemctl stop docker containerd || true
+                
+                # Symlink instead of bind-mount for persistence after home-wipe
+                - [ -L /var/lib/docker ] || (rm -rf /var/lib/docker && ln -s /mnt/pvc/docker /var/lib/docker)
+                - [ -L /var/lib/containerd ] || (rm -rf /var/lib/containerd && ln -s /mnt/pvc/containerd /var/lib/containerd)
+                - [ -L /var/cache/apt ] || (rm -rf /var/cache/apt && ln -s /mnt/pvc/apt_cache /var/cache/apt)
+
+                # Configure Docker Data-Root
+                - |
+                  echo '{
+                    "data-root": "/mnt/pvc/docker",
+                    "exec-opts": ["native.cgroupdriver=cgroupfs"],
+                    "storage-driver": "overlay2"
+                  }' > /etc/docker/daemon.json
+
+                # 3. NETWORK & SOFTWARE INSTALL
+                - ip link set dev enp1s0 mtu 1350
+                - apt-get update
+                - apt-get install -y docker.io curl openvpn git
+                
+                # 4. START SERVICES
+                - systemctl daemon-reload
+                - systemctl enable --now docker
+                
+                # 5. APP DEPLOYMENT (DOCK_HOP)
+                - cd /mnt/pvc
+                - [ -d dock_hop ] || git clone https://github.com/hasnaouiyacine59-wq/dock_hop.git
+                - cd dock_hop
+                
+                # Build only if image is missing to speed up boot
+                - |
+                  if [[ "$(docker images -q dock_hop 2> /dev/null)" == "" ]]; then
+                    docker build -t dock_hop .
+                  fi
+
+                # 6. RUN CONTAINER WITH PRIVILEGED CAPABILITIES
+                - docker rm -f nordvpn-1 || true
+                - |
+                  docker run -d \
+                    --name nordvpn-1 \
+                    --cap-add=NET_ADMIN \
+                    --cap-add=NET_RAW \
+                    --cap-add=SYS_ADMIN \
+                    --security-opt seccomp=unconfined \
+                    --device /dev/net/tun \
+                    -e NORDVPN_TOKEN="your_token" \
+                    -p 6081:6080 \
+                    dock_hop
+
+                # Final Cleanup of the 2GB root drive
+                - apt-get clean
+                - rm -rf /var/lib/apt/lists/*
