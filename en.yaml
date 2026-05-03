@@ -63,7 +63,8 @@ objects:
 
             - name: cloudinitdisk
               cloudInitNoCloud:
-                userData: |-
+                userDataSecretRef:
+                  name: camoufox-cloudinit
                   #cloud-config
                   user: ubuntu
                   password: ${PASSWORD}
