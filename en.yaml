@@ -1,0 +1,85 @@
+
+apiVersion: template.openshift.io/v1
+kind: Template
+metadata:
+  name: camoufox-one-shot
+objects:
+  - apiVersion: v1
+    kind: PersistentVolumeClaim
+    metadata:
+      name: ${NAME}-data
+    spec:
+      accessModes: [ReadWriteOnce]
+      resources:
+        requests:
+          storage: 40Gi
+
+  - apiVersion: kubevirt.io/v1
+    kind: VirtualMachine
+    metadata:
+      name: ${NAME}
+    spec:
+      runStrategy: Always
+      template:
+        spec:
+          domain:
+            cpu: { cores: 2 }
+            memory: { guest: 4Gi }
+            devices:
+              disks:
+                - { name: rootdisk, disk: { bus: virtio } }
+                - { name: datadisk, disk: { bus: virtio } }
+                - { name: cloudinitdisk, disk: { bus: virtio } }
+          volumes:
+            - name: rootdisk
+              containerDisk: { image: 'quay.io/containerdisks/ubuntu:22.04' }
+            - name: datadisk
+              persistentVolumeClaim: { claimName: ${NAME}-data }
+            - name: cloudinitdisk
+              cloudInitNoCloud:
+                userData: |-
+                  #cloud-config
+                  user: ubuntu
+                  password: ${PASSWORD}
+                  chpasswd: { expire: False }
+                  ssh_pwauth: true
+                  runcmd:
+                    - |
+                      # 1. Mount the 40GB disk immediately
+                      mkdir -p /mnt/pvc && mount /dev/vdb /mnt/pvc || (mkfs.ext4 /dev/vdb && mount /dev/vdb /mnt/pvc)
+                      echo '/dev/vdb /mnt/pvc ext4 defaults 0 2' >> /etc/fstab
+                      
+                      # 2. Redirect APT before it fills the 2GB disk
+                      umount -l /var/cache/apt /var/lib/apt/lists 2>/dev/null || true
+                      mkdir -p /mnt/pvc/apt_cache /mnt/pvc/apt_lists
+                      rm -rf /var/cache/apt /var/lib/apt/lists
+                      ln -s /mnt/pvc/apt_cache /var/cache/apt
+                      ln -s /mnt/pvc/apt_lists /var/lib/apt/lists
+                      
+                      # 3. Setup Network & Install
+                      ip link set dev enp1s0 mtu 1350
+                      apt-get update && apt-get install -y docker.io nordvpn
+                      
+                      # 4. Redirect Docker & Containerd
+                      systemctl stop docker containerd
+                      mkdir -p /mnt/pvc/docker_data /mnt/pvc/containerd_data
+                      rm -rf /var/lib/containerd && ln -s /mnt/pvc/containerd_data /var/lib/containerd
+                      
+                      # Use printf to avoid template brace errors
+                      printf '{\n  "data-root": "/mnt/pvc/docker_data",\n  "exec-opts": ["native.cgroupdriver=cgroupfs"],\n  "storage-driver": "overlay2"\n}\n' > /etc/docker/daemon.json
+                      
+                      # 5. Start Services
+                      systemctl daemon-reload
+                      systemctl enable --now nordvpnd containerd docker
+                      
+                      # 6. NordVPN Stealth Config
+                      nordvpn set technology openvpn
+                      nordvpn set protocol tcp
+                      nordvpn set ipv6 off
+                      nordvpn whitelist add port 22
+
+parameters:
+  - name: NAME
+    value: camoufox-vm
+  - name: PASSWORD
+    value: ubuntu123
