@@ -2,7 +2,7 @@ apiVersion: kubevirt.io/v1
 kind: VirtualMachine
 metadata:
   name: norvya-16da
-  namespace: mylastres0rt05-redha-dev
+  namespace: dev0p1-dev
 spec:
   runStrategy: Always
   template:
